@@ -1,0 +1,66 @@
+name: Discord bot
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */3 * * *"
+
+concurrency:
+  group: discord-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 358
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Восстановить состояние
+        uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: bot-state-${{ github.run_id }}
+          restore-keys: bot-state-
+
+      - name: Создать .env из секрета ENV_FILE
+        env:
+          ENV_FILE: ${{ secrets.ENV_FILE }}
+        run: |
+          if [ -z "$ENV_FILE" ]; then echo "::error::Добавьте секрет ENV_FILE с содержимым .env"; exit 1; fi
+          printf '%s\n' "$ENV_FILE" > .env
+
+      - name: Запустить бота
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          MEME_ON_STARTUP: "false"
+        run: |
+          end=$((SECONDS + 20700))   # 5ч45м
+          while [ $SECONDS -lt $end ]; do
+            code=0
+            MAX_RUNTIME_SECONDS=$((end - SECONDS)) python main.py || code=$?
+            if [ "$code" = "0" ] || [ "$code" = "2" ]; then break; fi   # штатный выход / ошибка настроек
+            echo "Бот упал (код $code), перезапуск через 30 секунд..."
+            sleep 30
+          done
+          [ "$code" != "2" ]
+
+      - name: Сохранить состояние
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data
+          key: bot-state-${{ github.run_id }}-${{ github.run_attempt }}
