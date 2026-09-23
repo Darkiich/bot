@@ -4,6 +4,8 @@
 """
 import asyncio
 import html
+import io
+import json
 import logging
 import random
 import re
@@ -20,6 +22,48 @@ UA = (
 HEADERS = {"User-Agent": UA, "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8"}
 MAX_BYTES = 8 * 1024 * 1024  # лимит вложения Discord без буста — 10 МБ, берём с запасом
 EXT = {"image/jpeg": "jpg", "image/jpg": "jpg", "image/png": "png", "image/gif": "gif", "image/webp": "webp"}
+MIN_SIDE = 250  # отсекаем иконки и мелкие превью
+
+# Обложки видео и роликов — это не мемы
+BLOCKED_HOSTS = ("ytimg.com", "youtube.com", "youtu.be", "rutube.ru", "tiktok", "vkvideo", "dzen.ru", "twitch")
+BLOCKED_WORDS = ("видео", "video", "подборк", "компиляц", "youtube", "ютуб", "tiktok", "тикток", "shorts",
+                 "смотреть", "выпуск", "стрим", "серия", "эпизод", "#shorts")
+
+
+def is_blocked(url: str, title: str = "", page: str = "") -> bool:
+    text = f"{url} {page}".lower()
+    if any(h in text for h in BLOCKED_HOSTS):
+        return True
+    t = (title or "").lower()
+    return any(w in t for w in BLOCKED_WORDS)
+
+
+def normalize_image(data: bytes) -> tuple[bytes, str] | None:
+    """Проверяет, что картинка целая (декодируется полностью), и приводит к формату, который Discord точно покажет."""
+    from PIL import Image
+
+    try:
+        im = Image.open(io.BytesIO(data))
+        fmt = im.format
+        animated_gif = fmt == "GIF" and getattr(im, "is_animated", False)
+        im.load()  # полное декодирование — обрезанный файл тут упадёт
+    except Exception:
+        return None
+    if min(im.size) < MIN_SIDE:
+        return None
+    if fmt == "JPEG":
+        return data, "jpg"
+    if fmt == "PNG" or (fmt == "GIF" and animated_gif):
+        return data, fmt.lower()
+    # webp и прочее → PNG (первый кадр), если слишком большой — JPEG
+    im = im.convert("RGBA" if im.mode in ("RGBA", "LA", "P") else "RGB")
+    out = io.BytesIO()
+    im.save(out, "PNG", optimize=True)
+    if out.tell() > MAX_BYTES:
+        out = io.BytesIO()
+        im.convert("RGB").save(out, "JPEG", quality=90)
+        return out.getvalue(), "jpg"
+    return out.getvalue(), "png"
 
 
 @dataclass
@@ -56,7 +100,10 @@ class MemeSource:
             )
 
         results = await asyncio.to_thread(run)
-        return [r["image"] for r in results if r.get("image")]
+        return [
+            r["image"] for r in results
+            if r.get("image") and not is_blocked(r["image"], r.get("title", ""), r.get("url", ""))
+        ]
 
     async def search_bing(self) -> list[str]:
         s = await self.session()
@@ -71,9 +118,16 @@ class MemeSource:
             r.raise_for_status()
             text = await r.text()
             status, final_url = r.status, str(r.url)
-        urls = re.findall(r'murl&quot;:&quot;(.*?)&quot;', text)
-        if not urls:  # на случай, если кавычки не экранированы
-            urls = re.findall(r'"murl":"(.*?)"', text)
+        urls = []
+        for m in re.findall(r'\bm="(\{.*?\})"', text):
+            try:
+                meta = json.loads(html.unescape(m))
+            except ValueError:
+                continue
+            if meta.get("murl") and not is_blocked(meta["murl"], meta.get("t", ""), meta.get("purl", "")):
+                urls.append(meta["murl"])
+        if not urls:  # запасной разбор без метаданных
+            urls = [u for u in re.findall(r'murl&quot;:&quot;(.*?)&quot;', text) if not is_blocked(html.unescape(u))]
         if not urls:
             title = re.search(r"<title>(.*?)</title>", text, re.S)
             log.warning("Bing: 0 картинок (HTTP %s, %s, %d байт, title=%r)",
@@ -96,7 +150,10 @@ class MemeSource:
         async with s.get("https://duckduckgo.com/i.js", params=params, headers=headers) as r:
             r.raise_for_status()
             data = await r.json(content_type=None)
-        return [item["image"] for item in data.get("results", []) if item.get("image")]
+        return [
+            item["image"] for item in data.get("results", [])
+            if item.get("image") and not is_blocked(item["image"], item.get("title", ""), item.get("url", ""))
+        ]
 
     # ---------- скачивание ----------
     async def download(self, url: str) -> Meme | None:
@@ -106,17 +163,24 @@ class MemeSource:
                 if r.status != 200:
                     return None
                 ctype = r.headers.get("Content-Type", "").split(";")[0].strip().lower()
-                if ctype not in EXT:
+                if ctype and not ctype.startswith("image/") and ctype != "application/octet-stream":
                     return None
                 if int(r.headers.get("Content-Length") or 0) > MAX_BYTES:
                     return None
-                data = await r.content.read(MAX_BYTES + 1)
-                if len(data) > MAX_BYTES or len(data) < 2048:
-                    return None
-                return Meme(url=url, data=data, filename=f"meme.{EXT[ctype]}")
+                buf = bytearray()
+                async for chunk in r.content.iter_chunked(64 * 1024):  # читаем файл ЦЕЛИКОМ
+                    buf += chunk
+                    if len(buf) > MAX_BYTES:
+                        return None
         except Exception as e:  # битые ссылки в выдаче — норма
             log.debug("Не скачалось %s: %s", url, e)
             return None
+        result = await asyncio.to_thread(normalize_image, bytes(buf))
+        if result is None:
+            log.debug("Битая/мелкая картинка: %s", url)
+            return None
+        data, ext = result
+        return Meme(url=url, data=data, filename=f"meme.{ext}")
 
     async def random_meme(self, exclude: set[str] | None = None) -> Meme:
         exclude = exclude or set()
