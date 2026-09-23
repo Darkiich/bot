@@ -1,4 +1,8 @@
-"""Поиск случайного мема в интернете (картинки Bing, запасной вариант — DuckDuckGo)."""
+"""Поиск случайного мема в интернете.
+
+Порядок: библиотека ddgs (Bing/DuckDuckGo с маскировкой под браузер) → свой парсер Bing → свой DuckDuckGo.
+"""
+import asyncio
 import html
 import logging
 import random
@@ -42,6 +46,18 @@ class MemeSource:
             await self._session.close()
 
     # ---------- поисковики ----------
+    async def search_ddgs(self) -> list[str]:
+        from ddgs import DDGS  # импорт здесь, чтобы бот стартовал даже без пакета
+
+        def run() -> list[dict]:
+            return DDGS(timeout=20).images(
+                self.query, region="ru-ru", safesearch="moderate",
+                max_results=100, page=random.randint(1, 3),
+            )
+
+        results = await asyncio.to_thread(run)
+        return [r["image"] for r in results if r.get("image")]
+
     async def search_bing(self) -> list[str]:
         s = await self.session()
         params = {
@@ -54,9 +70,14 @@ class MemeSource:
         async with s.get("https://www.bing.com/images/async", params=params) as r:
             r.raise_for_status()
             text = await r.text()
+            status, final_url = r.status, str(r.url)
         urls = re.findall(r'murl&quot;:&quot;(.*?)&quot;', text)
         if not urls:  # на случай, если кавычки не экранированы
             urls = re.findall(r'"murl":"(.*?)"', text)
+        if not urls:
+            title = re.search(r"<title>(.*?)</title>", text, re.S)
+            log.warning("Bing: 0 картинок (HTTP %s, %s, %d байт, title=%r)",
+                        status, final_url[:120], len(text), title.group(1).strip()[:80] if title else None)
         return [html.unescape(u) for u in urls]
 
     async def search_ddg(self) -> list[str]:
@@ -67,7 +88,12 @@ class MemeSource:
         if not m:
             raise RuntimeError("DuckDuckGo: не нашёл vqd-токен")
         params = {"l": "ru-ru", "o": "json", "q": self.query, "vqd": m.group(1), "f": ",,,,,", "p": "1"}
-        async with s.get("https://duckduckgo.com/i.js", params=params, headers={"Referer": "https://duckduckgo.com/"}) as r:
+        headers = {
+            "Referer": "https://duckduckgo.com/",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        async with s.get("https://duckduckgo.com/i.js", params=params, headers=headers) as r:
             r.raise_for_status()
             data = await r.json(content_type=None)
         return [item["image"] for item in data.get("results", []) if item.get("image")]
@@ -94,22 +120,20 @@ class MemeSource:
 
     async def random_meme(self, exclude: set[str] | None = None) -> Meme:
         exclude = exclude or set()
-        candidates: list[str] = []
-        for search in (self.search_bing, self.search_ddg):
+        for search in (self.search_ddgs, self.search_bing, self.search_ddg):
+            name = search.__name__.removeprefix("search_")
             try:
                 found = [u for u in await search() if u.startswith("http") and u not in exclude]
-                log.info("%s: найдено %d картинок", search.__name__, len(found))
-                candidates = found
             except Exception as e:
-                log.warning("%s не сработал: %s", search.__name__, e)
-            if candidates:
-                break
-        if not candidates:
-            raise RuntimeError("Не удалось найти ни одного мема")
-
-        random.shuffle(candidates)
-        for url in candidates[:10]:
-            meme = await self.download(url)
-            if meme:
-                return meme
-        raise RuntimeError("Не удалось скачать ни одну картинку из выдачи")
+                log.warning("%s не сработал: %s: %s", name, type(e).__name__, e)
+                continue
+            log.info("%s: найдено %d картинок", name, len(found))
+            random.shuffle(found)
+            for url in found[:15]:
+                meme = await self.download(url)
+                if meme:
+                    log.info("%s: скачан мем %s", name, url)
+                    return meme
+            if found:
+                log.warning("%s: ни одна из %d картинок не скачалась", name, min(len(found), 15))
+        raise RuntimeError("Не удалось получить мем ни из одного источника (подробности выше в логе)")
