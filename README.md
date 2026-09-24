@@ -20,25 +20,6 @@
 | `&meme` | доступ | отправить мем сейчас |
 | `&help` | все | список команд |
 
-## Настройки (.env)
-
-```env
-TOKEN=токен_бота
-PREFIX=&
-MEME_CHANNEL_ID=1552011762885197915
-WATCHED_ROLE_ID=1552258642835939348
-MEME_QUERY=смешные мемы старые
-MEME_INTERVAL_MINUTES=20
-CHECK_INTERVAL_HOURS=8
-MIN_REACTED_PERCENT=100
-REACTIONS=😂,💩
-PUNISH_EMOJI=💩
-MEME_ON_STARTUP=true
-COMMAND_ACCESS_IDS=1508568035206631645,568092953948454922
-```
-
-`TOKEN`, `MEME_CHANNEL_ID`, `WATCHED_ROLE_ID` обязательны, остальное — со значениями по умолчанию как выше.
-`MEME_ON_STARTUP=true` — мем сразу при запуске (удобно для проверки).
 
 ## Настройка бота в Discord
 
